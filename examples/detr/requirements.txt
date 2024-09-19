@@ -1,0 +1,10 @@
+transformers
+pycocotools
+#einops
+scipy
+#torch==2.3.0
+#torchvision
+pyparsing
+matplotlib
+timm
+optimum_habana
