@@ -6,7 +6,6 @@ from torch.utils.data import DataLoader
 
 from transformers import DetrForObjectDetection, DetrImageProcessor
 from torch.utils.data import DataLoader
-from evaluate import post_process_model_outputs
 
 import lightning as pl
 from lightning import Trainer, seed_everything
@@ -44,7 +43,6 @@ def parse_arguments():
     parser.add_argument('--inference-only', default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument('--autocast', default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument('--use-ckpt', default=False, action=argparse.BooleanOptionalAction)
-    parser.add_argument('--bf16', default=False, action=argparse.BooleanOptionalAction)
     parser.add_argument('--batch-size', default=4, type=int)
     parser.add_argument('--max-epochs', default=5, type=int)
     parser.add_argument('--max-steps', default=100000, type=int)
@@ -63,6 +61,11 @@ def parse_arguments():
     # Arguments specifically for inference
     parser.add_argument('--max-inf-frames', default=0, type=int)
     parser.parse_args(namespace=args)
+
+    # Do basic validation of args and adjust if required
+    if args.device not in ["cpu", "hpu", "cuda"]:
+        print(f'Unsupported device {args.device}')
+        exit()
     if args.deterministic:
         args.num_workers = 0
 
@@ -70,7 +73,6 @@ def show_arguments():
     print(f'inference-only = {args.inference_only}')
     print(f'autocast = {args.autocast}')
     print(f'use-ckpt = {args.use_ckpt}')
-    print(f'bf16 = {args.bf16}')
     print(f'batch-size = {args.batch_size}')
     print(f'max-epochs = {args.max_epochs}')
     print(f'max-steps = {args.max_steps}')
@@ -88,8 +90,8 @@ def show_arguments():
     print(f'max-inf-frames = {args.max_inf_frames}')
     
     # Derived parameters
-    precision = torch.bfloat16 if args.bf16 else torch.float32
     shuffle = False if args.deterministic else True
+    precision = torch.bfloat16 if args.autocast else torch.float32
     print(f'Derived params: precision = {precision}, shuffle = {shuffle}')
 
 # Classes and functions to process dataset
@@ -272,7 +274,10 @@ if args.device == 'hpu':
     from lightning_habana.pytorch.plugins.precision import HPUPrecisionPlugin
     from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
     adapt_transformers_to_gaudi()
-precision = torch.bfloat16 if args.bf16 else torch.float32
+
+# MixedPrecision requires a lower precision type specified
+# Use BFloat16 when autocast is enabled.
+precision = torch.bfloat16 if args.autocast else torch.float32
 
 ##  Step-2) Prepare dataloaders based on the args
 train_dataset = CocoDetection(img_folder=img_folder, ann_file=train_ann_file, processor=processor)
@@ -293,10 +298,6 @@ else:
     #load default model
     model = Detr(lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4, train_dl=train_dl, val_dl=val_dl)
 
-if not args.autocast:
-    print(f'Autocast is disabled. Casting model to {precision}')
-    model.model = model.model.to(precision)
-
 ##  Step-4) Prepare trainer object and call trainer.fit, save checkpoint
 checkpoint_callback = ModelCheckpoint(
     dirpath = args.ckpt_store_path,
@@ -315,33 +316,21 @@ trainer_kwargs = {
 }
 trainer_kwargs.update({'callbacks' : [checkpoint_callback]} if args.ckpt_store_interval_epochs != 0 else {'enable_checkpointing' : False} )
 
-if not args.inference_only:
-    if args.device == 'cpu' :
-        with torch.autocast(device_type="cpu", dtype=precision, enabled=args.autocast):
-            trainer = Trainer(
-                accelerator='cpu', 
-                **trainer_kwargs
-                )
-    elif args.device == 'hpu':
-        with torch.autocast(device_type="hpu", dtype=precision, enabled=args.autocast):
-            trainer = Trainer(
-                accelerator=HPUAccelerator(),
-                **trainer_kwargs
-            )
-    elif args.device == 'cuda':
-        print('Warning: CUDA path is untested')
-        if args.deterministic:
-            torch.use_deterministic_algorithms(True)
-        with torch.autocast(device_type="cuda", dtype=precision, enabled=args.autocast):
-            trainer = Trainer(
-                    accelerator="gpu",
-                    **trainer_kwargs)
-    else:
-        print(f'Unsupported device {args.device}')
-        exit()
+trainer_acc = args.device
+if args.device == "cuda":
+    print('Warning: CUDA path is untested')
+    if args.deterministic:
+        torch.use_deterministic_algorithms(True)
+    trainer_acc = "cuda"
 
-    trainer.fit(model)
-    trainer.save_checkpoint("./cppe-5.ckpt")
+if not args.autocast:
+    model = model.to(precision).to(args.device)
+
+if not args.inference_only:
+    with torch.autocast(device_type=args.device, dtype=precision, enabled=args.autocast):
+        trainer = Trainer(accelerator = trainer_acc, **trainer_kwargs)
+        trainer.fit(model)
+        trainer.save_checkpoint("./cppe-5.ckpt")
 
 if args.train_only:
     exit()
@@ -349,7 +338,6 @@ if args.train_only:
 ##  Step-5) Run inference on one image and save annotated output
 
 ### Try inference with new weights
-device = args.device
 cats = train_dataset.coco.cats
 id2label = {k: v['name'] for k,v in cats.items()}
 id2label[0]="na"  #to avoid error
@@ -358,25 +346,9 @@ image_id = 9 # Picking 9th image in val dataset
 pixel_values, target = val_dataset[image_id]
 pixel_values = pixel_values.unsqueeze(0)
 
-if not args.autocast:
-    model = model.to(precision).to(device)
-    pixel_values = pixel_values.to(precision).to(device)
-
-if device == 'cpu':
-    print(f'Running Inference with CPU. Precision = {precision}, autocast = {args.autocast}')
-    with torch.no_grad(), torch.autocast(device_type="cpu", dtype=precision, enabled=args.autocast):
-        outputs = model(pixel_values=pixel_values, pixel_mask=None)
-elif device == 'hpu':
-    print(f'Running Inference with HPU. Precision = {precision}, autocast = {args.autocast}')
-    with torch.no_grad(), torch.autocast(device_type="hpu", dtype=precision, enabled=args.autocast):
-        outputs = model(pixel_values=pixel_values, pixel_mask=None)
-        torch.hpu.synchronize()
-elif device == 'cuda':
-    print('Warning: CUDA path is untested')
-    print(f'Running Inference with CUDA. Precision = {precision}, autocast = {args.autocast}')
-    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=precision, enabled=args.autocast):
-        outputs = model(pixel_values=pixel_values, pixel_mask=None)
-        torch.cuda.synchronize()
+print(f'Running Inference with Device {args.device}. Precision = {precision}, autocast = {args.autocast}')
+with torch.no_grad(), torch.autocast(device_type=args.device, dtype=precision, enabled=args.autocast):
+    outputs = model(pixel_values=pixel_values, pixel_mask=None)
 
 # Post Process results - save annotated image and collect metrics
 image_size = torch.tensor([target["orig_size"].numpy()])
@@ -387,4 +359,3 @@ for results in post_processed_outputs:
     image_params = val_dataset.coco.loadImgs(image_id)[0]
     image = Image.open(os.path.join(img_folder, image_params['file_name']))
     plot_results(image, results['scores'], results['labels'], results['boxes'], tag=str(image_id), id2label=id2label)
-
