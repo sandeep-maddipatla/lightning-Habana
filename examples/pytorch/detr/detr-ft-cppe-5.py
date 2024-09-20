@@ -35,7 +35,6 @@ processor = DetrImageProcessor.from_pretrained("facebook/detr-resnet-50")
 COLORS = [[0.000, 0.447, 0.741], [0.850, 0.325, 0.098], [0.929, 0.694, 0.125],
           [0.494, 0.184, 0.556], [0.466, 0.674, 0.188], [0.301, 0.745, 0.933]]    
 
-
 # Argument Parsers
 def parse_arguments():
     global args
@@ -269,9 +268,7 @@ show_arguments()
 if args.deterministic:
     seed_everything(args.seed, workers=True)
 if args.device == 'hpu':
-    from lightning_habana.pytorch.profiler.profiler import HPUProfiler
     from lightning_habana.pytorch.accelerator       import HPUAccelerator
-    from lightning_habana.pytorch.plugins.precision import HPUPrecisionPlugin
     from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
     adapt_transformers_to_gaudi()
 
@@ -350,7 +347,7 @@ print(f'Running Inference with Device {args.device}. Precision = {precision}, au
 with torch.no_grad(), torch.autocast(device_type=args.device, dtype=precision, enabled=args.autocast):
     outputs = model(pixel_values=pixel_values, pixel_mask=None)
 
-# Post Process results - save annotated image and collect metrics
+# Post Process results - save annotated image
 image_size = torch.tensor([target["orig_size"].numpy()])
 post_processed_outputs = processor.post_process_object_detection(outputs, threshold=args.threshold, target_sizes=image_size)
 for results in post_processed_outputs:
