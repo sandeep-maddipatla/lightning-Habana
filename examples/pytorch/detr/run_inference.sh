@@ -2,7 +2,7 @@
 OUTDIR=${OUTDIR:-$(pwd)/outdir}
 LOGFILE=${LOGFILE:-$(pwd)/console.log}
 PROFILER=${1:-off}
-SCRIPT=detr-ft.py
+SCRIPT=detr_inference.py
 CMDLINE_LOG=$(pwd)/cmdline.log
 OPTIONS=${OPTIONS:-}
 HABANA_LOGS=${HABANA_LOGS:-$(pwd)/habana_logs}
@@ -36,7 +36,6 @@ mkdir -p ${OUTDIR}
 mv $(pwd)/lightning_logs/version_0 ${OUTDIR}/lightning_logs
 mv /root/metricslog.json ${OUTDIR} 2>/dev/null
 mv $(pwd)/cppe* ${OUTDIR} 2>/dev/null
-mv $(pwd)/*.ckpt ${OUTDIR} 2>/dev/null
 mv $(pwd)/*.jpg ${OUTDIR} 2>/dev/null
 mv ${LOGFILE} ${OUTDIR}
 mv ${CMDLINE_LOG} ${OUTDIR}
@@ -49,5 +48,3 @@ mv ${HL_SMI_LOG} ${OUTDIR}
 END_TIME=$(date)
 echo START ${START_TIME} | tee ${OUTDIR}/time.log
 echo STOP ${END_TIME} | tee -a ${OUTDIR}/time.log
-
-

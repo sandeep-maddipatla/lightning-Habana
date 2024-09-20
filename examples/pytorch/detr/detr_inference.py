@@ -9,7 +9,7 @@ from lightning import Trainer, seed_everything
 
 import matplotlib.pyplot as plt
 from PIL import Image
-from detr-ft-cppe-5 import parse_arguments, show_arguments, args, train_dataset, val_dataset, Detr, processor, plot_results
+from detr_ft import parse_arguments, show_arguments, args, train_dataset, val_dataset, Detr, processor, plot_results
 
 def end_pp_loop(batch_count):
     if (args.max_inf_frames > 0) and (args.batch_size * batch_count >= args.max_inf_frames):
@@ -22,7 +22,7 @@ def synchronize():
         torch.hpu.synchronize()
     elif args.device == 'cuda':
         torch.cuda.synchronize()
-
+asdfasdf
 ### Run inference over validation dataset
 
 ## Step-1: Parse args and set up config
@@ -74,16 +74,23 @@ if args.device == "cuda":
         torch.use_deterministic_algorithms(True)
     trainer_acc = "cuda"
 
+print(f'Running Inference with Device {args.device}. Precision = {precision}, autocast = {args.autocast}')
 with torch.no_grad(), torch.autocast(device_type=args.device, dtype=precision, enabled=args.autocast):
     trainer = Trainer(accelerator = trainer_acc, **trainer_kwargs)
     # forward pass to get class logits and bounding boxes
     predictions = trainer.predict(model, dataloaders = val_dl)
+    synchronize()
 
 ## Step-4: Annotate and save output images
 cats = val_dataset.coco.cats
 id2label = {k: v['name'] for k,v in cats.items()}
 val_dl_enum = enumerate(val_dl)
+
+image_batch_list = []
+image_sizes = []
 step = 0
+
+# Prepare image batches and image-sizes lists (one entry of size batch_size per batch)
 while not end_pp_loop(step):
     try:
         step, input = next(val_dl_enum)
@@ -91,8 +98,10 @@ while not end_pp_loop(step):
         target_batch = input["labels"]
     except StopIteration:
         break
-
-    target_batch_list.append(target_batch)
+    
+    batch_image_sizes = torch.tensor([x["orig_size"].numpy() for x in target_batch])
+    image_sizes.append(batch_image_sizes) 
+    
     image_batch = []
     for target in target_batch:
         image_id = target['image_id'].item()
@@ -101,13 +110,9 @@ while not end_pp_loop(step):
         image_batch.append(image)
     image_batch_list.append(image_batch)
 
-for batch in targets:
-    batch_image_sizes = torch.tensor([x["orig_size"].numpy() for x in batch])
-    image_sizes.append(batch_image_sizes) 
-
-count = 0
+# Run through Prediction-list (one entry of size batch_size per batch), with image_sizes and images, and post-process
 for batch, target_sizes, image_batch in zip(predictions, image_sizes, image_batch_list):
-    post_processed_output = image_processor.post_process_object_detection(
+    post_processed_output = processor.post_process_object_detection(
                             batch, threshold=threshold, target_sizes=target_sizes
                         )
     # Draw annotated image and save it as a file
@@ -115,22 +120,6 @@ for batch, target_sizes, image_batch in zip(predictions, image_sizes, image_batc
         for results, image in zip(post_processed_output, image_batch):
             plot_results(image, results['scores'], results['labels'], results['boxes'], id2label=id2label, tag=str(count))
             count += 1
-        except Exception as e:
-            print(f'Exception in saving annotated image at count={count}. Skipping')
-            print(f'Error message: {str(e)}')
-    
-
-# postprocess model outputs
-# Post Process results - save annotated image
-image_size = torch.tensor([target["orig_size"].numpy()])
-post_processed_outputs = processor.post_process_object_detection(outputs, threshold=args.threshold, target_sizes=image_size)
-for results in post_processed_outputs:
-    # Only one result (for one image) expected in list of outputs
-    image_id = target['image_id'].item()
-    image_params = val_dataset.coco.loadImgs(image_id)[0]
-    image = Image.open(os.path.join(img_folder, image_params['file_name']))
-    plot_results(image, results['scores'], results['labels'], results['boxes'], tag=str(image_id), id2label=id2label)
-
-metrics = post_process_model_outputs(predictions, target_batch_list, processor, threshold=args.threshold, id2label=id2label, image_batch_list=image_batch_list)
-print(f'metrics = {metrics}')
-
+    except Exception as e:
+        print(f'Exception in saving annotated image at count={count}. Skipping')
+        print(f'Error message: {str(e)}')
