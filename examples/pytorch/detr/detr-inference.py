@@ -4,42 +4,43 @@ import torchvision
 import numpy as np
 from torch.utils.data import DataLoader
 
-from arguments import parse_arguments, show_arguments, args
-from dataset_cppe5 import processor, prepare_dataloaders, get_num_labels, img_folder, train_dataset, val_dataset
-from evaluate import post_process_model_outputs
-
 import lightning as pl
 from lightning import Trainer, seed_everything
 
-from detr_module import Detr
 import matplotlib.pyplot as plt
 from PIL import Image
+from detr-ft-cppe-5 import parse_arguments, show_arguments, args, train_dataset, val_dataset, Detr, processor, plot_results
 
+def end_pp_loop(batch_count):
+    if (args.max_inf_frames > 0) and (args.batch_size * batch_count >= args.max_inf_frames):
+        return True
+    else:
+        return False
+
+def synchronize():
+    if args.device == 'hpu':
+        torch.hpu.synchronize()
+    elif args.device == 'cuda':
+        torch.cuda.synchronize()
+
+### Run inference over validation dataset
+
+## Step-1: Parse args and set up config
 parse_arguments()
 show_arguments()
 if args.deterministic:
     seed_everything(args.seed, workers=True)
 if args.device == 'hpu':
-    from lightning_habana.pytorch.profiler.profiler import HPUProfiler
     from lightning_habana.pytorch.accelerator       import HPUAccelerator
-    from lightning_habana.pytorch.plugins.precision import HPUPrecisionPlugin
-    from habana_frameworks.torch.utils.experimental import data_dynamicity
-    from habana_frameworks.torch.utils.experimental import detect_recompilation_auto_model
     from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
     adapt_transformers_to_gaudi()
-
-train_dl, val_dl = prepare_dataloaders()
 precision = torch.bfloat16 if args.bf16 else torch.float32
 
+## Step-2: Load model with specified checkpoint or defaults if none is specified
 if args.use_ckpt:
     try:
         #load model from checkpoint
         model = Detr.load_from_checkpoint(args.ckpt_path, lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4, train_dl=train_dl, val_dl=val_dl)
-
-        # Uncomment below if we need to convert the lightning checkpoint to one that is reloadable in plain HF-transformers API's i.e.
-        # AutoModel.from_pretrained() with custom local path instead of HF-Hub. 
-        # AutoModel.from_pretrained requires a checkpoint that is generated with save_pretrained.
-        #model.model.save_pretrained("./cppe5-hftransformers-ckpt.pt")
     except Exception as e:
         print(f'Error attempting to load checkpoint at {args.ckpt_path} .. Reverting to default model')
         print(f'Error message: {str(e)}')
@@ -54,62 +55,36 @@ if not args.autocast:
     print(f'Autocast is disabled. Casting model to {precision}')
     model.model = model.model.to(precision)       
         
-cats = val_dataset.coco.cats
-print(f'cats = {cats}')
-id2label = {k: v['name'] for k,v in cats.items()}
-print(f'id2label = {id2label}')
+## Step-3: Prepare trainer and run inference
+trainer_kwargs = {
+    'max_steps' : args.max_steps,
+    'max_epochs' : args.max_epochs,
+    'devices' : 1,
+    'gradient_clip_val' : 0.1,
+    'log_every_n_steps' : 1,
+    'deterministic' : args.deterministic,
+    'enable_checkpointing' : False,
+}
+trainer_kwargs.update({'callbacks' : [checkpoint_callback]} if args.ckpt_store_interval_epochs != 0 else {'enable_checkpointing' : False} )
 
-# Inferencing
-if args.device == 'cpu':
-    with torch.no_grad(), torch.autocast(device_type="cpu", dtype=precision, enabled=args.autocast):
-        trainer = Trainer(
-                accelerator='cpu', max_steps=args.max_steps, max_epochs=args.max_epochs, gradient_clip_val=0.1, enable_checkpointing=False, log_every_n_steps=1,
-                deterministic=args.deterministic
-                )
-elif args.device == 'hpu':
-    with torch.no_grad(), torch.autocast(device_type="hpu", dtype=precision, enabled=args.autocast):
-        trainer = Trainer(
-                accelerator=HPUAccelerator(),max_steps=args.max_steps, max_epochs=args.max_epochs, gradient_clip_val=0.1, enable_checkpointing=False, log_every_n_steps=1,
-                deterministic = args.deterministic,
-                #plugins=[HPUPrecisionPlugin(precision="32-true")] #bf16-mixed
-                #,profiler=HPUProfiler()
-            )
-elif args.device == 'cuda':
-    print('CUDA path is unverified')
-    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=precision, enabled=args.autocast):
-        trainer = Trainer(
-                accelerator="gpu",
-                max_steps=args.max_steps, max_epochs=args.max_epochs, gradient_clip_val=0.1, enable_checkpointing=False, log_every_n_steps=1,
-                deterministic = args.deterministic,
-                devices=1
-            )
-else:
-    print(f'Unsupported device {args.device}')
-    exit()
+trainer_acc = args.device
+if args.device == "cuda":
+    print('Warning: CUDA path is untested')
+    if args.deterministic:
+        torch.use_deterministic_algorithms(True)
+    trainer_acc = "cuda"
 
-autocast = torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=True)
-
-with torch.no_grad(), autocast:
+with torch.no_grad(), torch.autocast(device_type=args.device, dtype=precision, enabled=args.autocast):
+    trainer = Trainer(accelerator = trainer_acc, **trainer_kwargs)
     # forward pass to get class logits and bounding boxes
     predictions = trainer.predict(model, dataloaders = val_dl)
-    if args.device == 'hpu':
-        torch.hpu.synchronize()
-    elif args.device == 'cuda':
-        torch.cuda.synchronize()
-  
-# Prepare targets and images
-target_batch_list = []
-image_batch_list = []
 
-def end_test(batch_count):
-    if (args.max_inf_frames > 0) and (args.batch_size * batch_count >= args.max_inf_frames):
-        return True
-    else:
-        return False
-
+## Step-4: Annotate and save output images
+cats = val_dataset.coco.cats
+id2label = {k: v['name'] for k,v in cats.items()}
 val_dl_enum = enumerate(val_dl)
 step = 0
-while not end_test(step):
+while not end_pp_loop(step):
     try:
         step, input = next(val_dl_enum)
         pv = input["pixel_values"]
@@ -126,8 +101,36 @@ while not end_test(step):
         image_batch.append(image)
     image_batch_list.append(image_batch)
 
+for batch in targets:
+    batch_image_sizes = torch.tensor([x["orig_size"].numpy() for x in batch])
+    image_sizes.append(batch_image_sizes) 
+
+count = 0
+for batch, target_sizes, image_batch in zip(predictions, image_sizes, image_batch_list):
+    post_processed_output = image_processor.post_process_object_detection(
+                            batch, threshold=threshold, target_sizes=target_sizes
+                        )
+    # Draw annotated image and save it as a file
+    try:
+        for results, image in zip(post_processed_output, image_batch):
+            plot_results(image, results['scores'], results['labels'], results['boxes'], id2label=id2label, tag=str(count))
+            count += 1
+        except Exception as e:
+            print(f'Exception in saving annotated image at count={count}. Skipping')
+            print(f'Error message: {str(e)}')
+    
 
 # postprocess model outputs
+# Post Process results - save annotated image
+image_size = torch.tensor([target["orig_size"].numpy()])
+post_processed_outputs = processor.post_process_object_detection(outputs, threshold=args.threshold, target_sizes=image_size)
+for results in post_processed_outputs:
+    # Only one result (for one image) expected in list of outputs
+    image_id = target['image_id'].item()
+    image_params = val_dataset.coco.loadImgs(image_id)[0]
+    image = Image.open(os.path.join(img_folder, image_params['file_name']))
+    plot_results(image, results['scores'], results['labels'], results['boxes'], tag=str(image_id), id2label=id2label)
+
 metrics = post_process_model_outputs(predictions, target_batch_list, processor, threshold=args.threshold, id2label=id2label, image_batch_list=image_batch_list)
 print(f'metrics = {metrics}')
 
