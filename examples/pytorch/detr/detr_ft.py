@@ -25,6 +25,8 @@ num_labels = 5  #TODO: automate this from json files in dataset instead of hardc
 buckets = None
 train_dataloader = None
 val_dataloader = None
+train_dataset = None
+val_dataset = None
 img_folder = '/root/gs-274/CPPE-Dataset/data/images'
 annotations_folder = '/root/gs-274/CPPE-Dataset/data/annotations'
 train_ann_file = os.path.join(annotations_folder, "train.json")
@@ -153,6 +155,11 @@ def collate_fn(batch):
     batch['labels'] = labels
     return batch
 
+def init_datasets():
+    train_dataset = CocoDetection(img_folder=img_folder, ann_file=train_ann_file, processor=processor)
+    val_dataset = CocoDetection(img_folder=img_folder, ann_file=val_ann_file, processor=processor, train=False)
+    return train_dataset, val_dataset
+
 def prepare_dataloaders(train_dataset, val_dataset, test_dataset=None):
     global buckets
     global train_dataloader
@@ -260,99 +267,102 @@ def plot_results(pil_img, scores, labels, boxes, tag="", id2label=None):
     print(f"Saved output image as {'output_image' + tag + '.jpg'}")
 
 
-### Run Training and test sample result
+def main():
+    ### Run Training and test sample result
 
-##  Step-1) Parse args and prepare configuration controls
-parse_arguments()
-show_arguments()
-if args.deterministic:
-    seed_everything(args.seed, workers=True)
-if args.device == 'hpu':
-    from lightning_habana.pytorch.accelerator       import HPUAccelerator
-    from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
-    adapt_transformers_to_gaudi()
+    ##  Step-1) Parse args and prepare configuration controls
+    parse_arguments()
+    show_arguments()
+    if args.deterministic:
+        seed_everything(args.seed, workers=True)
+    if args.device == 'hpu':
+        from lightning_habana.pytorch.accelerator       import HPUAccelerator
+        from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
+        adapt_transformers_to_gaudi()
 
-# MixedPrecision requires a lower precision type specified
-# Use BFloat16 when autocast is enabled.
-precision = torch.bfloat16 if args.autocast else torch.float32
+    # MixedPrecision requires a lower precision type specified
+    # Use BFloat16 when autocast is enabled.
+    precision = torch.bfloat16 if args.autocast else torch.float32
 
-##  Step-2) Prepare dataloaders based on the args
-train_dataset = CocoDetection(img_folder=img_folder, ann_file=train_ann_file, processor=processor)
-val_dataset = CocoDetection(img_folder=img_folder, ann_file=val_ann_file, processor=processor, train=False)
-train_dl, val_dl = prepare_dataloaders(train_dataset, val_dataset)
+    ##  Step-2) Prepare dataloaders based on the args
+    train_dataset, val_dataset = init_datasets()
+    train_dl, val_dl = prepare_dataloaders()
 
-##  Step-3) Load model with specified configuration
-if args.use_ckpt:
-    try:
-        #load model from lightning checkpoint
-        model = Detr.load_from_checkpoint(args.ckpt_path, lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4, train_dl=train_dl, val_dl=val_dl)
-    except Exception as e:
-        print(f'Error attempting to load checkpoint at {args.ckpt_path} .. Reverting to default model')
-        print(f'Error message: {str(e)}')
+    ##  Step-3) Load model with specified configuration
+    if args.use_ckpt:
+        try:
+            #load model from lightning checkpoint
+            model = Detr.load_from_checkpoint(args.ckpt_path, lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4, train_dl=train_dl, val_dl=val_dl)
+        except Exception as e:
+            print(f'Error attempting to load checkpoint at {args.ckpt_path} .. Reverting to default model')
+            print(f'Error message: {str(e)}')
+            #load default model
+            model = Detr(lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4, train_dl=train_dl, val_dl=val_dl)
+    else:
         #load default model
         model = Detr(lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4, train_dl=train_dl, val_dl=val_dl)
-else:
-    #load default model
-    model = Detr(lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4, train_dl=train_dl, val_dl=val_dl)
 
-##  Step-4) Prepare trainer object and call trainer.fit, save checkpoint
-checkpoint_callback = ModelCheckpoint(
-    dirpath = args.ckpt_store_path,
-    every_n_epochs = args.ckpt_store_interval_epochs,
-    filename = 'detr-cppe5-epoch{epoch:03d}',
-    auto_insert_metric_name=False,
-    save_top_k = -1
-)
-trainer_kwargs = {
-    'max_steps' : args.max_steps,
-    'max_epochs' : args.max_epochs,
-    'devices' : 1,
-    'gradient_clip_val' : 0.1,
-    'log_every_n_steps' : 1,
-    'deterministic' : args.deterministic,
-}
-trainer_kwargs.update({'callbacks' : [checkpoint_callback]} if args.ckpt_store_interval_epochs != 0 else {'enable_checkpointing' : False} )
+    ##  Step-4) Prepare trainer object and call trainer.fit, save checkpoint
+    checkpoint_callback = ModelCheckpoint(
+        dirpath = args.ckpt_store_path,
+        every_n_epochs = args.ckpt_store_interval_epochs,
+        filename = 'detr-cppe5-epoch{epoch:03d}',
+        auto_insert_metric_name=False,
+        save_top_k = -1
+    )
+    trainer_kwargs = {
+        'max_steps' : args.max_steps,
+        'max_epochs' : args.max_epochs,
+        'devices' : 1,
+        'gradient_clip_val' : 0.1,
+        'log_every_n_steps' : 1,
+        'deterministic' : args.deterministic,
+    }
+    trainer_kwargs.update({'callbacks' : [checkpoint_callback]} if args.ckpt_store_interval_epochs != 0 else {'enable_checkpointing' : False} )
 
-trainer_acc = args.device
-if args.device == "cuda":
-    print('Warning: CUDA path is untested')
-    if args.deterministic:
-        torch.use_deterministic_algorithms(True)
-    trainer_acc = "cuda"
+    trainer_acc = args.device
+    if args.device == "cuda":
+        print('Warning: CUDA path is untested')
+        if args.deterministic:
+            torch.use_deterministic_algorithms(True)
+        trainer_acc = "cuda"
 
-if not args.autocast:
-    model = model.to(precision).to(args.device)
+    if not args.autocast:
+        model = model.to(precision).to(args.device)
 
-if not args.inference_only:
-    with torch.autocast(device_type=args.device, dtype=precision, enabled=args.autocast):
-        trainer = Trainer(accelerator = trainer_acc, **trainer_kwargs)
-        trainer.fit(model)
-        trainer.save_checkpoint("./cppe-5.ckpt")
+    if not args.inference_only:
+        with torch.autocast(device_type=args.device, dtype=precision, enabled=args.autocast):
+            trainer = Trainer(accelerator = trainer_acc, **trainer_kwargs)
+            trainer.fit(model)
+            trainer.save_checkpoint("./cppe-5.ckpt")
 
-if args.train_only:
-    exit()
+    if args.train_only:
+        exit()
 
-##  Step-5) Run inference on one image and save annotated output
+    ##  Step-5) Run inference on one image and save annotated output
 
-### Try inference with new weights
-cats = train_dataset.coco.cats
-id2label = {k: v['name'] for k,v in cats.items()}
-id2label[0]="na"  #to avoid error
+    ### Try inference with new weights
+    cats = train_dataset.coco.cats
+    id2label = {k: v['name'] for k,v in cats.items()}
+    id2label[0]="na"  #to avoid error
 
-image_id = 9 # Picking 9th image in val dataset
-pixel_values, target = val_dataset[image_id]
-pixel_values = pixel_values.unsqueeze(0)
+    image_id = 9 # Picking 9th image in val dataset
+    pixel_values, target = val_dataset[image_id]
+    pixel_values = pixel_values.unsqueeze(0)
 
-print(f'Running Inference with Device {args.device}. Precision = {precision}, autocast = {args.autocast}')
-with torch.no_grad(), torch.autocast(device_type=args.device, dtype=precision, enabled=args.autocast):
-    outputs = model(pixel_values=pixel_values, pixel_mask=None)
+    print(f'Running Inference with Device {args.device}. Precision = {precision}, autocast = {args.autocast}')
+    with torch.no_grad(), torch.autocast(device_type=args.device, dtype=precision, enabled=args.autocast):
+        outputs = model(pixel_values=pixel_values, pixel_mask=None)
 
-# Post Process results - save annotated image
-image_size = torch.tensor([target["orig_size"].numpy()])
-post_processed_outputs = processor.post_process_object_detection(outputs, threshold=args.threshold, target_sizes=image_size)
-for results in post_processed_outputs:
-    # Only one result (for one image) expected in list of outputs
-    image_id = target['image_id'].item()
-    image_params = val_dataset.coco.loadImgs(image_id)[0]
-    image = Image.open(os.path.join(img_folder, image_params['file_name']))
-    plot_results(image, results['scores'], results['labels'], results['boxes'], tag=str(image_id), id2label=id2label)
+    # Post Process results - save annotated image
+    image_size = torch.tensor([target["orig_size"].numpy()])
+    post_processed_outputs = processor.post_process_object_detection(outputs, threshold=args.threshold, target_sizes=image_size)
+    for results in post_processed_outputs:
+        # Only one result (for one image) expected in list of outputs
+        image_id = target['image_id'].item()
+        image_params = val_dataset.coco.loadImgs(image_id)[0]
+        image = Image.open(os.path.join(img_folder, image_params['file_name']))
+        plot_results(image, results['scores'], results['labels'], results['boxes'], tag=str(image_id), id2label=id2label)
+
+if __name__ == '__main__':
+    main()

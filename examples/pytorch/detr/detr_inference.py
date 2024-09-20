@@ -9,7 +9,12 @@ from lightning import Trainer, seed_everything
 
 import matplotlib.pyplot as plt
 from PIL import Image
-from detr_ft import parse_arguments, show_arguments, args, train_dataset, val_dataset, Detr, processor, plot_results
+from detr_ft import (
+    parse_arguments, show_arguments, args,
+    init_datasets, prepare_dataloaders, img_folder,
+    Detr, processor,
+    plot_results
+)
 
 def end_pp_loop(batch_count):
     if (args.max_inf_frames > 0) and (args.batch_size * batch_count >= args.max_inf_frames):
@@ -22,10 +27,10 @@ def synchronize():
         torch.hpu.synchronize()
     elif args.device == 'cuda':
         torch.cuda.synchronize()
-asdfasdf
+
 ### Run inference over validation dataset
 
-## Step-1: Parse args and set up config
+## Step-1: Parse args and set up config, initialize dataloaders
 parse_arguments()
 show_arguments()
 if args.deterministic:
@@ -34,7 +39,9 @@ if args.device == 'hpu':
     from lightning_habana.pytorch.accelerator       import HPUAccelerator
     from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
     adapt_transformers_to_gaudi()
-precision = torch.bfloat16 if args.bf16 else torch.float32
+precision = torch.bfloat16 if args.autocast else torch.float32
+train_dataset, val_dataset = init_datasets()
+train_dl, val_dl = prepare_dataloaders(train_dataset, val_dataset)
 
 ## Step-2: Load model with specified checkpoint or defaults if none is specified
 if args.use_ckpt:
@@ -89,7 +96,7 @@ val_dl_enum = enumerate(val_dl)
 image_batch_list = []
 image_sizes = []
 step = 0
-
+count = 0
 # Prepare image batches and image-sizes lists (one entry of size batch_size per batch)
 while not end_pp_loop(step):
     try:
@@ -113,7 +120,7 @@ while not end_pp_loop(step):
 # Run through Prediction-list (one entry of size batch_size per batch), with image_sizes and images, and post-process
 for batch, target_sizes, image_batch in zip(predictions, image_sizes, image_batch_list):
     post_processed_output = processor.post_process_object_detection(
-                            batch, threshold=threshold, target_sizes=target_sizes
+                            batch, threshold=args.threshold, target_sizes=target_sizes
                         )
     # Draw annotated image and save it as a file
     try:
