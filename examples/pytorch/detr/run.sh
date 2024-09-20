@@ -2,7 +2,7 @@
 OUTDIR=${OUTDIR:-$(pwd)/outdir}
 LOGFILE=${LOGFILE:-$(pwd)/console.log}
 PROFILER=${1:-off}
-SCRIPT=detr-ft.py
+SCRIPT=detr_ft.py
 CMDLINE_LOG=$(pwd)/cmdline.log
 OPTIONS=${OPTIONS:-}
 HABANA_LOGS=${HABANA_LOGS:-$(pwd)/habana_logs}
