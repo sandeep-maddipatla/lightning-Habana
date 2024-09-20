@@ -286,7 +286,7 @@ def main():
 
     ##  Step-2) Prepare dataloaders based on the args
     train_dataset, val_dataset = init_datasets()
-    train_dl, val_dl = prepare_dataloaders()
+    train_dl, val_dl = prepare_dataloaders(train_dataset, val_dataset)
 
     ##  Step-3) Load model with specified configuration
     if args.use_ckpt:
