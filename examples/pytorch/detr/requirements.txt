@@ -1,0 +1,7 @@
+transformers
+pycocotools
+scipy
+pyparsing
+matplotlib
+timm
+optimum_habana
